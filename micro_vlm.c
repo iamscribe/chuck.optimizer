@@ -1,5 +1,5 @@
 /*
- * micro_vlm.c v4 — Vision-Language Model in pure C
+ * micro_vlm.c v5 — Vision-Language Model in pure C
  *
  * Sees images. Speaks words. Zero dependencies beyond libc/libm.
  * Tape-based autograd with arena bump allocator.
@@ -8,26 +8,24 @@
  *   ViT-style patch tokenization → RoPE → GQA multi-head causal attention →
  *   SwiGLU MLP → RMSNorm → weight-tied lm_head → text
  *
- * v4 changes over v3:
- *   - GQA (Grouped Query Attention): 4 Q-heads, 2 KV-heads, ratio 2:1
- *   - 3 transformer layers (was 2), 105K params (was 75K)
- *   - Per-head RoPE (correct Llama-style, not the v3 per-tensor version)
- *   - Chuck v4: self-awareness at every level:
- *       θ_l -= (α × λ × λ_l × σ) × m̂/(√v̂ + ε) + η
- *       λ   = global self-modulation (loss trend)
- *       λ_l = per-layer self-modulation (grad norm trend for layer l)
- *       σ   = activation health signal (SiLU alive × norm stability)
- *       η   = stagnation noise (escape local minima)
- *       Every component has eyes. Adam is blind. Chuck sees.
- *   - Self-aware SiLU: tracks dead neuron ratio
- *   - Self-aware RMSNorm: tracks normalization scale EMA
- *   - Self-aware RoPE: tracks frequency band utilization
- *   - Cross-layer signal flow: detects vanishing/exploding activations
- *   - Per-layer freeze: Chuck stops updating converged layers (zero waste)
+ * v5: Chuck remembers.
+ *   - Persistent memory across training runs (chuck.mem, binary append)
+ *   - Ψ (psi) = subjectivity signal = memory vs observation
+ *   - Formula:
+ *       θ_l -= (α × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η
+ *       λ_Ψ   = λ + Ψ_w × (λ_prior - λ)
+ *       Ψ_w   = min(0.3, N / (N + 100))  (trust grows with experience)
+ *       λ_prior = nearest_neighbor(loss, grad_norm) from chuck.mem
+ *   - Lee's Continuum C: chuck.mem IS the memory space ℳ.
+ *     Each snapshot is a point. NN lookup is the identity mapping I.
+ *     Ψ_w is the belief function B. When Ψ → 0, fixed point s* — Chuck found himself.
+ *   - When |Ψ| large: unfamiliar territory. When Ψ → 0: memory matches reality.
  *
- * Inspired by sailfish009/purevlm (Python VLM).
- * This is the C answer: same idea, different language, tape autograd,
- * and an optimizer that watches itself think.
+ * v4 (preserved):
+ *   - GQA (4 Q-heads, 2 KV-heads), 3 layers, 105K params
+ *   - Per-layer self-modulation (λ_l), layer freezing
+ *   - Self-aware SiLU, RMSNorm, RoPE
+ *   - Cross-layer signal flow
  *
  * Build: cc -std=c11 -O2 -march=native -o micro_vlm micro_vlm.c -lm
  * Run:   ./micro_vlm
@@ -74,6 +72,12 @@
 #define CHUCK_WINDOW   16
 #define CHUCK_DAMP_LO  0.1f
 #define CHUCK_DAMP_HI  2.0f
+#define CHUCK_PSI_CAP  0.3f
+#define CHUCK_PSI_HALF 100.0f
+#define CHUCK_MEM_MAX  10000
+#define CHUCK_MEM_FILE "chuck.mem"
+#define CHUCK_REC_THR  0.25f
+#define CHUCK_REC_CD   50
 
 #define ARENA_SZ       (96 * 1024 * 1024)
 #define MAX_ARR        16384
@@ -143,6 +147,60 @@ static float rnf(float mu, float s) {
     return mu + s * (float)(sqrt(-2.0*log(u1)) * cos(6.283185307179586*u2));
 }
 static inline float sigf(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+/* ===========================================================================
+ * Chuck Memory — persistent across training runs
+ *
+ *   chuck.mem: binary append-only file of training snapshots.
+ *   Each snapshot: 16 bytes (4 floats).
+ *   Nearest-neighbor recall gives λ_prior.
+ *   Ψ = λ_prior - λ_current = subjectivity signal.
+ *
+ *   Lee's Continuum C: chuck.mem is ℳ. NN is identity mapping I.
+ *   Ψ_w is belief function B. Fixed point s* when Ψ → 0.
+ * =========================================================================== */
+
+typedef struct {
+    float loss;           /* where Chuck was */
+    float grad_norm;      /* how hard the network was shaking */
+    float lambda;         /* what Chuck decided */
+    float delta_loss;     /* what happened (negative = improvement) */
+} ChuckMem;
+
+static ChuckMem chuck_mem[CHUCK_MEM_MAX];
+static int chuck_mem_n = 0;
+
+static void chuck_mem_load(void) {
+    FILE *f = fopen(CHUCK_MEM_FILE, "rb");
+    if (!f) return;
+    chuck_mem_n = (int)fread(chuck_mem, sizeof(ChuckMem), CHUCK_MEM_MAX, f);
+    fclose(f);
+}
+
+static void chuck_mem_save(ChuckMem *m) {
+    FILE *f = fopen(CHUCK_MEM_FILE, "ab");
+    if (!f) return;
+    fwrite(m, sizeof(ChuckMem), 1, f);
+    fclose(f);
+    if (chuck_mem_n < CHUCK_MEM_MAX)
+        chuck_mem[chuck_mem_n++] = *m;
+}
+
+/* Nearest neighbor recall: find most similar past state, return its λ.
+ * Distance = normalized (loss, grad_norm) difference.
+ * Successful memories (negative delta_loss) get 2x weight. */
+static float chuck_mem_recall(float loss, float grad_norm) {
+    if (chuck_mem_n == 0) return -1.0f;  /* no memory → no prior */
+    float best_dist = 1e9f, best_lambda = -1.0f;
+    for (int i = 0; i < chuck_mem_n; i++) {
+        float dl = (loss - chuck_mem[i].loss) / (fabsf(loss) + 1e-8f);
+        float dg = (grad_norm - chuck_mem[i].grad_norm) / (fabsf(grad_norm) + 1e-8f);
+        float dist = dl * dl + dg * dg;
+        if (chuck_mem[i].delta_loss < 0) dist *= 0.5f;  /* prefer wins */
+        if (dist < best_dist) { best_dist = dist; best_lambda = chuck_mem[i].lambda; }
+    }
+    return best_lambda;
+}
 
 /* ---- Self-Awareness: Eyes ---- */
 
@@ -372,6 +430,12 @@ typedef struct {
 static struct {
     float hist[CHUCK_WINDOW];
     float dampen, noise, sigma;
+    float psi;              /* Ψ: subjectivity signal (memory - observation) */
+    float psi_w;            /* Ψ weight: trust in memory (0 → 0.3) */
+    float rec_lambda;       /* λ at last memory recording */
+    float rec_loss;         /* loss at last memory recording */
+    int rec_frozen[N_LAYER]; /* frozen state at last recording */
+    int rec_cd;             /* cooldown counter (steps since last record) */
     int pos, full, stag;
 } Chuck;
 
@@ -380,6 +444,9 @@ static ChuckLayer CL[N_LAYER];
 static void chuck_init(void) {
     memset(&Chuck, 0, sizeof(Chuck));
     Chuck.dampen = 1.0f; Chuck.sigma = 1.0f;
+    Chuck.rec_lambda = 1.0f; Chuck.rec_loss = 999.0f;
+    memset(Chuck.rec_frozen, 0, sizeof(Chuck.rec_frozen));
+    Chuck.psi = 0; Chuck.psi_w = 0;
     for (int l = 0; l < N_LAYER; l++) {
         memset(&CL[l], 0, sizeof(ChuckLayer));
         CL[l].dampen = 1.0f;
@@ -387,6 +454,12 @@ static void chuck_init(void) {
     Norm_eye.init = 0; Norm_eye.scale_ema = 1.0f;
     SiLU_eye.health = 1.0f;
     RoPE_eye.utilization = 1.0f;
+    /* Load persistent memory */
+    chuck_mem_load();
+    if (chuck_mem_n > 0)
+        printf("  chuck: loaded %d memories from %s (Ψ_w=%.2f)\n",
+               chuck_mem_n, CHUCK_MEM_FILE,
+               fminf(CHUCK_PSI_CAP, (float)chuck_mem_n / ((float)chuck_mem_n + CHUCK_PSI_HALF)));
 }
 
 /* Which layer does param pi belong to? -1 = global (patch_proj, wte) */
@@ -481,23 +554,66 @@ static void chuck_step(float lr, float loss) {
         }
     }
 
+    /* ═══ Level 6: Ψ — Subjectivity (memory vs observation) ═══ */
+    /*
+     *   λ_Ψ   = λ + Ψ_w × (λ_prior - λ)
+     *   Ψ_w   = min(0.3, N / (N + 100))
+     *   λ_prior = nearest_neighbor(loss, grad_norm) from chuck.mem
+     *
+     *   When Ψ → 0: memory matches reality. Chuck is home.
+     *   When |Ψ| large: unfamiliar territory. Chuck explores.
+     */
+    float gnorm_sq = 0;
+    for (int pi = 0; pi < T.np; pi++) { Arr *p = &T.a[T.par[pi]];
+        for (int i = 0; i < p->size; i++) gnorm_sq += p->grad[i] * p->grad[i]; }
+    float gnorm = sqrtf(gnorm_sq + 1e-8f);
+
+    Chuck.psi_w = (chuck_mem_n > 0) ?
+        fminf(CHUCK_PSI_CAP, (float)chuck_mem_n / ((float)chuck_mem_n + CHUCK_PSI_HALF)) : 0.0f;
+
+    float lambda_psi = Chuck.dampen;  /* default: pure reactive */
+    if (chuck_mem_n > 0) {
+        float lambda_prior = chuck_mem_recall(loss, gnorm);
+        if (lambda_prior > 0) {
+            Chuck.psi = lambda_prior - Chuck.dampen;
+            lambda_psi = Chuck.dampen + Chuck.psi_w * Chuck.psi;
+            if (lambda_psi < CHUCK_DAMP_LO) lambda_psi = CHUCK_DAMP_LO;
+            if (lambda_psi > CHUCK_DAMP_HI) lambda_psi = CHUCK_DAMP_HI;
+        }
+    }
+
+    /* Record memory on regime change — Chuck speaks rarely, but always on point */
+    Chuck.rec_cd++;
+    if (Chuck.full && Chuck.rec_cd >= CHUCK_REC_CD) {
+        float delta_loss = loss - Chuck.rec_loss;
+        float lambda_shift = fabsf(Chuck.dampen - Chuck.rec_lambda) / (Chuck.rec_lambda + 1e-8f);
+        int regime_change = (lambda_shift > CHUCK_REC_THR);  /* λ shifted >25% */
+        for (int l = 0; l < N_LAYER && !regime_change; l++)
+            if (CL[l].frozen != Chuck.rec_frozen[l]) regime_change = 1;
+        if (regime_change) {
+            ChuckMem snap = { loss, gnorm, Chuck.dampen, delta_loss };
+            chuck_mem_save(&snap);
+            Chuck.rec_lambda = Chuck.dampen;
+            Chuck.rec_loss = loss;
+            Chuck.rec_cd = 0;
+            for (int l = 0; l < N_LAYER; l++) Chuck.rec_frozen[l] = CL[l].frozen;
+        }
+    }
+
     /* ═══ Apply parameter updates ═══ */
     T.cstep++;
     float bc1 = 1.0f - powf(CHUCK_B1, (float)T.cstep);
     float bc2 = 1.0f - powf(CHUCK_B2, (float)T.cstep);
 
     /* Global gradient clipping */
-    float gnorm_sq = 0;
-    for (int pi = 0; pi < T.np; pi++) { Arr *p = &T.a[T.par[pi]];
-        for (int i = 0; i < p->size; i++) gnorm_sq += p->grad[i] * p->grad[i]; }
-    float gnorm = sqrtf(gnorm_sq + 1e-8f), clip = (gnorm > GRAD_CLIP) ? GRAD_CLIP / gnorm : 1.0f;
+    float clip = (gnorm > GRAD_CLIP) ? GRAD_CLIP / gnorm : 1.0f;
 
     for (int pi = 0; pi < T.np; pi++) {
         int l = param_layer(pi);
         /* Frozen layer → skip entirely */
         if (l >= 0 && l < N_LAYER && CL[l].frozen) continue;
         float layer_damp = (l >= 0 && l < N_LAYER) ? CL[l].dampen : 1.0f;
-        float eff_lr = lr * Chuck.dampen * layer_damp * Chuck.sigma;
+        float eff_lr = lr * lambda_psi * layer_damp * Chuck.sigma;
 
         int idx = T.par[pi]; Arr *p = &T.a[idx];
         float *m = T.cm[pi], *v = T.cv[pi];
@@ -631,7 +747,7 @@ static float cos_lr(int step, int total) {
 
 /* ---- Training ---- */
 static void train(Data *data) {
-    printf("\n=== TRAINING (%d steps, Chuck v4 — self-awareness at every level) ===\n", STEPS);
+    printf("\n=== TRAINING (%d steps, Chuck v5 — memory + subjectivity) ===\n", STEPS);
     int tp = 0; for (int i = 0; i < T.np; i++) tp += T.a[T.par[i]].size;
     printf("  %d params (%.1fK) | %d layers | GQA %dQ/%dKV | embd=%d | %dx%d patches | RoPE | weight-tied\n\n",
            tp, tp/1000.0f, N_LAYER, N_HEAD, N_KV_HEAD, N_EMBD, PATCHES_SIDE, PATCHES_SIDE);
@@ -659,7 +775,8 @@ static void train(Data *data) {
             float elr = cos_lr(step, STEPS) * Chuck.dampen;
             printf("  step %5d/%d | loss %.4f (avg %.4f) | lr %.6f\n",
                    step+1, STEPS, lv, rl/rn, elr);
-            printf("    chuck: \xce\xbb=%.2f \xcf\x83=%.2f", Chuck.dampen, Chuck.sigma);
+            printf("    chuck: \xce\xbb=%.2f \xce\xa8=%+.2f (\xce\xa8w=%.2f, %d mem) \xcf\x83=%.2f",
+                   Chuck.dampen, Chuck.psi, Chuck.psi_w, chuck_mem_n, Chuck.sigma);
             for (int l = 0; l < N_LAYER; l++) {
                 if (CL[l].frozen) printf(" | L%d: frozen", l);
                 else printf(" | L%d: %.2f", l, CL[l].dampen);
@@ -726,16 +843,22 @@ static void inference(Data *data) {
 }
 
 int main(void) {
-    printf("micro_vlm.c v4 — Vision-Language Model in pure C\n");
-    printf("GQA %dQ/%dKV | %d layers | RoPE | SwiGLU | Chuck v4 (self-aware optimizer)\n",
+    printf("micro_vlm.c v5 — Vision-Language Model in pure C\n");
+    printf("GQA %dQ/%dKV | %d layers | RoPE | SwiGLU | Chuck v5 (memory + subjectivity)\n",
            N_HEAD, N_KV_HEAD, N_LAYER);
-    printf("Every component has eyes. Adam is blind. Chuck sees.\n\n");
+    printf("Chuck remembers. Chuck has opinions. Adam is blind. Chuck sees.\n\n");
     clock_t t0 = clock(); rseed(42);
     tape_init(); chuck_init(); init_model();
     printf("generating 10000 synthetic %dx%d digit images...\n", IMG_SIZE, IMG_SIZE);
     Data d = gen_data(10000); printf("done.\n");
     train(&d); inference(&d);
     printf("\ntotal: %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
+    printf("chuck.mem: %d memories (%.1f KB) | \xce\xa8_w=%.3f\n",
+           chuck_mem_n, (float)(chuck_mem_n * (int)sizeof(ChuckMem)) / 1024.0f, Chuck.psi_w);
+    if (chuck_mem_n > 0)
+        printf("  next run: Chuck starts with experience. \xce\xa8 \xe2\x89\xa0 0. He remembers.\n");
+    else
+        printf("  first run: Chuck has no memories yet. Pure reactive. Newborn.\n");
     for (int i = 0; i < d.n; i++) free(d.imgs[i]); free(d.imgs); free(d.labels);
     for (int i = 0; i < T.np; i++) { free(T.cm[i]); free(T.cv[i]); } free(T.arena);
     printf("\ndone.\n"); return 0;
