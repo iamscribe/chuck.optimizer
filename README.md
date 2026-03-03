@@ -1,4 +1,4 @@
-# Chuck
+# Chuck Optimizer
 
 **Optimizer with self-awareness.**
 
