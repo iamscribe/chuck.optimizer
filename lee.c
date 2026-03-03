@@ -37,6 +37,20 @@
 #include <stdint.h>
 #include <time.h>
 
+/* ---- BLAS acceleration (optional) ----
+ *   Mac:   cc -DUSE_BLAS -DACCELERATE ... -framework Accelerate
+ *   Linux: cc -DUSE_BLAS ... -lopenblas
+ *   Off:   cc ... -lm  (zero deps, scalar fallback)
+ */
+#ifdef USE_BLAS
+  #ifdef ACCELERATE
+    #define ACCELERATE_NEW_LAPACK
+    #include <Accelerate/Accelerate.h>
+  #else
+    #include <cblas.h>
+  #endif
+#endif
+
 /* ---- Config ---- */
 #define IMG_SIZE       8
 #define PATCH_SIZE     4
@@ -311,8 +325,14 @@ static int op_scale(int xi, float s) {
 }
 static int op_mv(int Wi, int xi) {
     int r = T.a[Wi].rows, c = T.a[Wi].cols, zi = anew(r);
+#ifdef USE_BLAS
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, r, c,
+                1.0f, T.a[Wi].data, c, T.a[xi].data, 1,
+                0.0f, T.a[zi].data, 1);
+#else
     for (int i = 0; i < r; i++) { float s = 0; const float *Wr = &T.a[Wi].data[i*c];
         for (int j = 0; j < c; j++) s += Wr[j] * T.a[xi].data[j]; T.a[zi].data[i] = s; }
+#endif
     rec(OP_MATVEC,zi,Wi,xi,0,0); return zi;
 }
 static int op_rms(int xi) {
