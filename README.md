@@ -294,6 +294,10 @@ Every model deserves a Chuck.
 
 ## Credits
 
+**[@Entrpi](https://github.com/Entrpi)** — adversarial benchmarks on DGX Blackwell that made
+Chuck stronger with every round. EMA smoothing (v5), multi-scale awareness (v7), and
+reservoir sampling (v7) all exist because of his CIFAR-100 benchmarks. See [Issue #3](https://github.com/ariannamethod/chuck.optimizer/issues/3).
+
 The VLM wrapper is inspired by [sailfish009/purevlm](https://github.com/sailfish009/purevlm).
 They did it in Python. We answered in C. Thank you for the spark.
 
