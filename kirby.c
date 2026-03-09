@@ -57,9 +57,10 @@
 #define LR           0.001f
 #define BETA_COMMIT  0.25f  /* commitment loss weight */
 #define EMA_DECAY    0.99f  /* codebook EMA decay */
-#define STEPS        50000
+#define STEPS        100000
 #define LOG_EVERY    500
-#define SAVE_EVERY   10000
+#define SAVE_EVERY   20000
+#define CB_RESET_EVERY 2000  /* reset dead codebook entries */
 
 /* ---- RNG ---- */
 static uint64_t rng_state = 42;
@@ -222,6 +223,39 @@ static void codebook_ema_update(Codebook *cb, const float *z, int idx) {
         cb->embed[idx * Z_DIM + j] = cb->ema_sum[idx * Z_DIM + j] / n;
 }
 
+/* Track codebook usage and reset dead codes */
+static int cb_usage[N_CODES];
+static int cb_track_total = 0;
+
+static void codebook_track(int code) {
+    cb_usage[code]++;
+    cb_track_total++;
+}
+
+/* Reset dead codes: replace unused codes with random encoder outputs + noise */
+static void codebook_reset_dead(Codebook *cb) {
+    int dead = 0;
+    for (int i = 0; i < N_CODES; i++) {
+        if (cb_usage[i] == 0) {
+            dead++;
+            /* Replace with a random live code + noise */
+            int live = 0;
+            for (int j = 0; j < N_CODES; j++) if (cb_usage[j] > 0) { live = j; break; }
+            for (int j = 0; j < Z_DIM; j++) {
+                cb->embed[i * Z_DIM + j] = cb->embed[live * Z_DIM + j] + randn() * 0.01f;
+                cb->ema_sum[i * Z_DIM + j] = cb->embed[i * Z_DIM + j];
+            }
+            cb->ema_count[i] = 1.0f;
+        }
+    }
+    if (dead > 0) {
+        int used = N_CODES - dead;
+        printf("    codebook: %d/%d alive, reset %d dead codes\n", used, N_CODES, dead);
+    }
+    memset(cb_usage, 0, sizeof(cb_usage));
+    cb_track_total = 0;
+}
+
 /* ---- VQ-VAE Model (3-layer encoder/decoder, ~1M params) ---- */
 typedef struct {
     /* Encoder: patch(192) → 672 → 384 → z(128) */
@@ -312,6 +346,7 @@ static float vqvae_train_patch(VQVAE *m, const float *patch) {
 
     /* ---- EMA codebook update ---- */
     codebook_ema_update(&m->cb, enc_z, code);
+    codebook_track(code);
 
     return mse;
 }
@@ -572,9 +607,8 @@ int main(int argc, char **argv) {
                    t, STEPS, step_loss, running_loss / rn, t / elapsed);
             running_loss = 0; rn = 0;
         }
-        if (t % SAVE_EVERY == 0) {
-            vqvae_save(&model, save_path);
-        }
+        if (t % CB_RESET_EVERY == 0) codebook_reset_dead(&model.cb);
+        if (t % SAVE_EVERY == 0) vqvae_save(&model, save_path);
     }
 
     vqvae_save(&model, save_path);

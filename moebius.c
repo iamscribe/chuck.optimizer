@@ -46,12 +46,14 @@
 #define T_STEPS      500      /* diffusion timesteps (training) */
 #define T_SAMPLE     50       /* sampling steps (inference, DDIM-like skip) */
 
-#define TIME_DIM     64       /* timestep embedding dim */
-#define H1_DIM       512      /* hidden layer 1 */
-#define H2_DIM       512      /* hidden layer 2 */
-#define IN_DIM       (IMG_SZ + TIME_DIM)  /* 1088 */
+#define TIME_DIM     128      /* timestep embedding dim */
+#define H1_DIM       1024     /* hidden layer 1 */
+#define H2_DIM       1024     /* hidden layer 2 */
+#define H3_DIM       512      /* hidden layer 3 */
+#define IN_DIM       (IMG_SZ + TIME_DIM)  /* 1152 */
 
-#define LR           0.0002f
+#define LR           0.0003f
+#define WARMUP       2000
 #define STEPS        100000
 #define BATCH        1        /* no accumulation for simplicity */
 #define LOG_EVERY    1000
@@ -202,32 +204,35 @@ static void silu_bwd(const float *x_pre, float *grad, int n) {
  * ε_θ(x_t, t) — predicts noise given noisy image and timestep
  *
  * Architecture:
- *   [x_t (1024) | time_emb (64)] → Linear(1088, 512) → SiLU
- *   → Linear(512, 512) → SiLU → Linear(512, 1024) → ε
+ *   [x_t (1024) | time_emb (128)] → 1024 → SiLU → 1024 → SiLU
+ *   → 512 → SiLU → 1024 → ε
  *
- * Skip connection: layer2 output += layer1 output (residual)
+ * Skip connections: l1→l3 (U-Net style down→up)
  */
 typedef struct {
-    Linear time_proj;  /* (TIME_DIM, TIME_DIM) — timestep MLP */
-    Linear l1;         /* (H1_DIM, IN_DIM) */
-    Linear l2;         /* (H2_DIM, H1_DIM) */
-    Linear l3;         /* (IMG_SZ, H2_DIM) */
-    /* Skip projection: H1 → H2 (if dims match, could be identity) */
+    Linear time_proj;  /* (TIME_DIM, TIME_DIM) */
+    Linear l1;         /* (H1_DIM, IN_DIM)  = (1024, 1152) — down */
+    Linear l2;         /* (H2_DIM, H1_DIM)  = (1024, 1024) — down */
+    Linear l3;         /* (H3_DIM, H2_DIM)  = (512, 1024)  — bottleneck */
+    Linear l4;         /* (IMG_SZ, H3_DIM + H1_DIM)  = (1024, 512+1024) — up + skip */
 } Denoiser;
+
+#define L4_IN (H3_DIM + H1_DIM)  /* skip concat */
 
 static Denoiser denoiser_new(void) {
     Denoiser d;
     d.time_proj = linear_new(TIME_DIM, TIME_DIM);
     d.l1 = linear_new(H1_DIM, IN_DIM);
     d.l2 = linear_new(H2_DIM, H1_DIM);
-    d.l3 = linear_new(IMG_SZ, H2_DIM);
+    d.l3 = linear_new(H3_DIM, H2_DIM);
+    d.l4 = linear_new(IMG_SZ, L4_IN);
     return d;
 }
 
 /* Sinusoidal timestep embedding */
 static void time_embed(int t, float *out) {
     for (int i = 0; i < TIME_DIM / 2; i++) {
-        float freq = expf(-logf(10000.0f) * i / (TIME_DIM / 2));
+        float freq = expf(-logf(10000.0f) * (float)i / (TIME_DIM / 2));
         out[i]              = sinf(t * freq);
         out[i + TIME_DIM/2] = cosf(t * freq);
     }
@@ -235,13 +240,17 @@ static void time_embed(int t, float *out) {
 
 /* Forward buffers */
 static float t_emb_raw[TIME_DIM], t_emb[TIME_DIM];
-static float inp[IN_DIM];              /* concat(x_t, time_emb) */
-static float h1_pre[H1_DIM], h1[H1_DIM];  /* layer 1 pre/post activation */
-static float h2_pre[H2_DIM], h2[H2_DIM];  /* layer 2 pre/post activation */
-static float eps_pred[IMG_SZ];         /* predicted noise */
+static float inp[IN_DIM];
+static float h1_pre[H1_DIM], h1[H1_DIM];
+static float h2_pre[H2_DIM], h2[H2_DIM];
+static float h3_pre[H3_DIM], h3[H3_DIM];
+static float l4_in[L4_IN];  /* concat(h3, h1) for skip */
+static float eps_pred[IMG_SZ];
 
 /* Backward buffers */
 static float d_eps[IMG_SZ];
+static float d_l4_in[L4_IN];
+static float d_h3[H3_DIM], d_h3_pre[H3_DIM];
 static float d_h2[H2_DIM], d_h2_pre[H2_DIM];
 static float d_h1[H1_DIM], d_h1_pre[H1_DIM];
 static float d_inp[IN_DIM];
@@ -257,39 +266,55 @@ static void denoiser_fwd(Denoiser *d, const float *x_t, int t) {
     memcpy(inp, x_t, IMG_SZ * sizeof(float));
     memcpy(inp + IMG_SZ, t_emb, TIME_DIM * sizeof(float));
 
-    /* layer 1 */
+    /* layer 1: down */
     linear_fwd(&d->l1, inp, h1_pre);
     memcpy(h1, h1_pre, H1_DIM * sizeof(float));
     silu_fwd(h1, H1_DIM);
 
-    /* layer 2 + skip from layer 1 */
+    /* layer 2: down */
     linear_fwd(&d->l2, h1, h2_pre);
-    /* residual: since H1_DIM == H2_DIM, add h1 directly */
-    for (int i = 0; i < H2_DIM; i++) h2_pre[i] += h1[i];
     memcpy(h2, h2_pre, H2_DIM * sizeof(float));
     silu_fwd(h2, H2_DIM);
 
-    /* output */
-    linear_fwd(&d->l3, h2, eps_pred);
+    /* layer 3: bottleneck */
+    linear_fwd(&d->l3, h2, h3_pre);
+    memcpy(h3, h3_pre, H3_DIM * sizeof(float));
+    silu_fwd(h3, H3_DIM);
+
+    /* layer 4: up with skip from h1 */
+    memcpy(l4_in, h3, H3_DIM * sizeof(float));
+    memcpy(l4_in + H3_DIM, h1, H1_DIM * sizeof(float));  /* skip connection */
+    linear_fwd(&d->l4, l4_in, eps_pred);
 }
 
 static void denoiser_bwd(Denoiser *d, const float *x_t, int t) {
-    /* d_eps already filled by caller (MSE grad) */
+    /* d_eps already filled by caller */
+
+    /* layer 4 backward */
+    memset(d_l4_in, 0, sizeof(d_l4_in));
+    linear_bwd(&d->l4, l4_in, d_eps, d_l4_in);
+
+    /* split d_l4_in → d_h3 and skip to d_h1 */
+    memcpy(d_h3, d_l4_in, H3_DIM * sizeof(float));
+    /* skip grad goes to h1, will be added later */
+
+    /* SiLU backward on h3 */
+    memcpy(d_h3_pre, d_h3, H3_DIM * sizeof(float));
+    silu_bwd(h3_pre, d_h3_pre, H3_DIM);
 
     /* layer 3 backward */
     memset(d_h2, 0, sizeof(d_h2));
-    linear_bwd(&d->l3, h2, d_eps, d_h2);
+    linear_bwd(&d->l3, h2, d_h3_pre, d_h2);
 
     /* SiLU backward on h2 */
     memcpy(d_h2_pre, d_h2, H2_DIM * sizeof(float));
     silu_bwd(h2_pre, d_h2_pre, H2_DIM);
-    /* skip connection: d_h2_pre also flows to h1 */
 
     /* layer 2 backward */
     memset(d_h1, 0, sizeof(d_h1));
     linear_bwd(&d->l2, h1, d_h2_pre, d_h1);
-    /* add skip gradient */
-    for (int i = 0; i < H1_DIM; i++) d_h1[i] += d_h2[i];  /* from residual h1 → h2_pre */
+    /* add skip gradient from l4 */
+    for (int i = 0; i < H1_DIM; i++) d_h1[i] += d_l4_in[H3_DIM + i];
 
     /* SiLU backward on h1 */
     memcpy(d_h1_pre, d_h1, H1_DIM * sizeof(float));
@@ -299,9 +324,8 @@ static void denoiser_bwd(Denoiser *d, const float *x_t, int t) {
     memset(d_inp, 0, sizeof(d_inp));
     linear_bwd(&d->l1, inp, d_h1_pre, d_inp);
 
-    /* time_proj backward (for completeness — trains the time embedding) */
+    /* time_proj backward */
     memcpy(d_t_emb, d_inp + IMG_SZ, TIME_DIM * sizeof(float));
-    /* SiLU was applied to t_emb — need pre-SiLU for backward */
     float t_emb_pre_silu[TIME_DIM];
     time_embed(t, t_emb_pre_silu);
     float t_emb_after_proj[TIME_DIM];
@@ -448,8 +472,8 @@ static void model_save(Denoiser *d, const char *path) {
     uint32_t magic = MOE_MAGIC;
     fwrite(&magic, 4, 1, f);
     /* save all layer weights */
-    Linear *layers[] = {&d->time_proj, &d->l1, &d->l2, &d->l3};
-    for (int i = 0; i < 4; i++) {
+    Linear *layers[] = {&d->time_proj, &d->l1, &d->l2, &d->l3, &d->l4};
+    for (int i = 0; i < 5; i++) {
         fwrite(layers[i]->w, sizeof(float), layers[i]->rows * layers[i]->cols, f);
         fwrite(layers[i]->b, sizeof(float), layers[i]->rows, f);
     }
@@ -462,8 +486,8 @@ static int model_load(Denoiser *d, const char *path) {
     if (!f) return -1;
     uint32_t magic; fread(&magic, 4, 1, f);
     if (magic != MOE_MAGIC) { fclose(f); return -1; }
-    Linear *layers[] = {&d->time_proj, &d->l1, &d->l2, &d->l3};
-    for (int i = 0; i < 4; i++) {
+    Linear *layers[] = {&d->time_proj, &d->l1, &d->l2, &d->l3, &d->l4};
+    for (int i = 0; i < 5; i++) {
         fread(layers[i]->w, sizeof(float), layers[i]->rows * layers[i]->cols, f);
         fread(layers[i]->b, sizeof(float), layers[i]->rows, f);
     }
@@ -491,7 +515,8 @@ int main(int argc, char **argv) {
     printf("moebius.c — ASCII art diffusion (Jean Giraud drew with ink)\n");
     printf("  density map: %d×%d = %d values | %d diffusion steps | %d sample steps\n",
            IMG_W, IMG_H, IMG_SZ, T_STEPS, T_SAMPLE);
-    printf("  denoiser: [%d+%d] → %d → %d → %d\n", IMG_SZ, TIME_DIM, H1_DIM, H2_DIM, IMG_SZ);
+    printf("  denoiser: [%d+%d] → %d → %d → %d → %d (skip l1→l4)\n",
+           IMG_SZ, TIME_DIM, H1_DIM, H2_DIM, H3_DIM, IMG_SZ);
 
     /* count params */
     int tp = TIME_DIM*TIME_DIM + TIME_DIM
@@ -578,8 +603,8 @@ int main(int argc, char **argv) {
 
         /* gradient clipping */
         float gnorm = 0;
-        Linear *layers[] = {&model.time_proj, &model.l1, &model.l2, &model.l3};
-        for (int l = 0; l < 4; l++) {
+        Linear *layers[] = {&model.time_proj, &model.l1, &model.l2, &model.l3, &model.l4};
+        for (int l = 0; l < 5; l++) {
             int n = layers[l]->rows * layers[l]->cols;
             for (int i = 0; i < n; i++) gnorm += layers[l]->dw[i] * layers[l]->dw[i];
             for (int i = 0; i < layers[l]->rows; i++) gnorm += layers[l]->db[i] * layers[l]->db[i];
@@ -587,7 +612,7 @@ int main(int argc, char **argv) {
         gnorm = sqrtf(gnorm);
         if (gnorm > 1.0f) {
             float scale = 1.0f / gnorm;
-            for (int l = 0; l < 4; l++) {
+            for (int l = 0; l < 5; l++) {
                 int n = layers[l]->rows * layers[l]->cols;
                 for (int i = 0; i < n; i++) layers[l]->dw[i] *= scale;
                 for (int i = 0; i < layers[l]->rows; i++) layers[l]->db[i] *= scale;
@@ -596,7 +621,8 @@ int main(int argc, char **argv) {
 
         /* Adam step */
         int adam_t = step + 1;
-        for (int l = 0; l < 4; l++) linear_adam(layers[l], LR, adam_t);
+        float cur_lr = (adam_t < WARMUP) ? LR * adam_t / WARMUP : LR;
+        for (int l = 0; l < 5; l++) linear_adam(layers[l], cur_lr, adam_t);
 
         running_loss += loss; rn++;
 
