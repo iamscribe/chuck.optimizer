@@ -1,36 +1,32 @@
 /*
- * lee.c v7 — Vision-Language Model in pure C
+ * lee.c v8 — Vision-Language Model in pure C
  *
  * Named after Bruce Lee (the only man who beat Chuck Norris)
  * and Minhyeok Lee (whose self-identity framework gives Chuck his soul).
  *
- * Sees images. Speaks words. Adds numbers. Zero dependencies.
+ * Sees images. Speaks words. Classifies CIFAR-100. Zero dependencies.
  * Tape-based autograd with arena bump allocator.
  *
  * Architecture:
  *   ViT-style patch tokenization → 2D RoPE → GQA multi-head causal attention →
  *   SwiGLU MLP → RMSNorm → weight-tied lm_head → text
  *
- * v7: Chuck sees the forest AND the trees.
+ * v8: 10M params, CIFAR-100 (100 classes), RGB patches, CUDA support.
+ *   - 256 embd, 8 heads, 4 KV heads, 10 layers, 1024 MLP
+ *   - 32×32 RGB images, 8×8 patches (4×4 grid = 16 patches)
+ *   - Char-level class name generation
+ *   - cuBLAS acceleration for GPU training
+ *
+ * v7 (preserved):
  *   - Multi-scale awareness: macro EMA + patience-based LR decay (Level 9)
  *   - Memory cap: reservoir sampling, bounded O(1) lookup
  *
- * v6 (preserved):
- *   - Attention entropy monitoring per head (Level 8 self-awareness)
- *   - Adaptive gradient clipping (Chuck controls clip, not a constant)
- *   - Digit addition task: [img_3] + [img_5] → "eight"
- *   - 2D RoPE for spatial awareness on image patches
+ * Build:
+ *   CPU:  cc -std=c11 -O2 -march=native -o lee lee.c -lm
+ *   BLAS: cc -std=c11 -O2 -DUSE_BLAS -DACCELERATE -framework Accelerate -o lee lee.c -lm
+ *   CUDA: cc -std=c11 -O2 -DUSE_CUDA -o lee lee.c -lm -lcublas -lcudart -L/usr/local/cuda/lib64
  *
- * v5 (preserved):
- *   - Persistent memory (chuck.mem), Ψ subjectivity, Lee's Continuum C
- *   - λ_Ψ = λ + Ψ_w × (λ_prior - λ), Ψ_w = min(0.3, N/(N+100))
- *
- * v4 (preserved):
- *   - GQA (4Q/2KV), 3 layers, 105K params, per-layer λ_l, layer freezing
- *   - Self-aware SiLU, RMSNorm, RoPE, cross-layer signal flow
- *
- * Build: cc -std=c11 -O2 -march=native -o lee lee.c -lm
- * Run:   ./lee
+ * Run: ./lee --data cifar-100-binary
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -44,41 +40,47 @@
 /* ---- BLAS acceleration (optional) ----
  *   Mac:   cc -DUSE_BLAS -DACCELERATE ... -framework Accelerate
  *   Linux: cc -DUSE_BLAS ... -lopenblas
+ *   CUDA:  cc -DUSE_CUDA ... -lcublas -lcudart
  *   Off:   cc ... -lm  (zero deps, scalar fallback)
  */
-#ifdef USE_BLAS
-  #ifdef ACCELERATE
-    #define ACCELERATE_NEW_LAPACK
-    #include <Accelerate/Accelerate.h>
-  #else
-    #include <cblas.h>
-  #endif
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#elif defined(USE_BLAS)
+#ifdef ACCELERATE
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
 #endif
 
 /* ---- Config ---- */
-#define IMG_SIZE       8
-#define PATCH_SIZE     4
+#define IMG_SIZE       32
+#define IMG_CH         3
+#define PATCH_SIZE     8
 #define PATCHES_SIDE   (IMG_SIZE / PATCH_SIZE)
 #define N_PATCHES      (PATCHES_SIDE * PATCHES_SIDE)
-#define PATCH_PX       (PATCH_SIZE * PATCH_SIZE)
-#define N_IMGS         2                           /* two digit images → addition */
-#define N_VIS          (N_IMGS * N_PATCHES)        /* 8 visual tokens */
-#define MAX_TXT        12                          /* "seventeen" + BOS + EOS */
+#define PATCH_PX       (PATCH_SIZE * PATCH_SIZE * IMG_CH)
+#define N_IMGS         1
+#define N_VIS          (N_IMGS * N_PATCHES)        /* 16 visual tokens */
+#define MAX_TXT        16                          /* longest class name + BOS + EOS */
 #define SEQ_LEN        (N_VIS + MAX_TXT)
-#define N_EMBD         48
-#define N_HEAD         4
-#define N_KV_HEAD      2
+#define N_EMBD         256
+#define N_HEAD         8
+#define N_KV_HEAD      4
 #define N_KV_GROUP     (N_HEAD / N_KV_HEAD)
 #define HEAD_DIM       (N_EMBD / N_HEAD)
 #define KV_DIM         (N_KV_HEAD * HEAD_DIM)
-#define N_LAYER        3
+#define N_LAYER        10
 #define MLP_DIM        (4 * N_EMBD)
-#define VOCAB          18
-#define BOS            16
-#define EOS            17
-#define STEPS          15000
-#define LR_MAX         0.005f
-#define WARMUP         500
+#define N_CHARS        27
+#define BOS            N_CHARS
+#define EOS            (N_CHARS + 1)
+#define VOCAB          (N_CHARS + 2)
+#define N_CLASSES      100
+#define STEPS          30000
+#define LR_MAX         0.003f
+#define WARMUP         1000
 #define CHUCK_B1       0.9f
 #define CHUCK_B2       0.999f
 #define CHUCK_EPS      1e-8f
@@ -91,18 +93,18 @@
 #define CHUCK_DAMP_HI  2.0f
 #define CHUCK_PSI_CAP  0.3f
 #define CHUCK_PSI_HALF 100.0f
-#define CHUCK_MEM_CAP  200         /* bounded memory (reservoir sampling) */
+#define CHUCK_MEM_CAP  500         /* bounded memory (reservoir sampling) */
 #define CHUCK_MEM_MAX  CHUCK_MEM_CAP
 #define CHUCK_MEM_FILE "chuck.mem"
 #define CHUCK_REC_THR  0.25f
 #define CHUCK_REC_CD   50
-#define CHUCK_MACRO_INT 500        /* macro patience check interval (steps) */
+#define CHUCK_MACRO_INT 1000       /* macro patience check interval (steps) */
 #define CHUCK_MACRO_PAT 3          /* patience: N checks without improvement → LR drop */
 #define CHUCK_MACRO_DECAY 0.5f     /* LR scale factor on macro plateau */
 
-#define ARENA_SZ       (128 * 1024 * 1024)
-#define MAX_ARR        32768
-#define MAX_ENT        65536
+#define ARENA_SZ       (512 * 1024 * 1024)
+#define MAX_ARR        65536
+#define MAX_ENT        131072
 #define MAX_PAR        128
 
 /* ---- Tape engine ---- */
@@ -118,7 +120,7 @@ static struct {
     int par[MAX_PAR]; int np;
     float *cm[MAX_PAR], *cv[MAX_PAR]; int cstep;
     int on;
-} T; 
+} T;
 
 static float *aalloc(size_t n) {
     size_t b = n * sizeof(float), al = (T.apos + 15) & ~(size_t)15;
@@ -212,7 +214,7 @@ static void chuck_mem_save(ChuckMem *m) {
         int slot = (int)(rnext() % (uint64_t)chuck_mem_total);
         if (slot < CHUCK_MEM_CAP) {
             chuck_mem[slot] = *m;
-            /* Rewrite entire file (200 entries × 16 bytes = 3.2 KB — trivial) */
+            /* Rewrite entire file (500 entries × 16 bytes = 8 KB — trivial) */
             FILE *f = fopen(CHUCK_MEM_FILE, "wb");
             if (f) { fwrite(chuck_mem, sizeof(ChuckMem), chuck_mem_n, f); fclose(f); }
         }
@@ -310,15 +312,10 @@ static float act_mag[N_LAYER];
 /* 2D position table for RoPE — image patches get (row,col), text gets sequential */
 static int pos_row[SEQ_LEN], pos_col[SEQ_LEN];
 static void init_positions(void) {
-    /* Image A patches: grid positions */
+    /* Single image patches: 4×4 grid */
     for (int p = 0; p < N_PATCHES; p++) {
         pos_row[p] = p / PATCHES_SIDE;
         pos_col[p] = p % PATCHES_SIDE;
-    }
-    /* Image B patches: offset columns to distinguish from A */
-    for (int p = 0; p < N_PATCHES; p++) {
-        pos_row[N_PATCHES + p] = p / PATCHES_SIDE;
-        pos_col[N_PATCHES + p] = PATCHES_SIDE + (p % PATCHES_SIDE);
     }
     /* Text tokens: sequential rows below images, col=0 */
     for (int t = 0; t < MAX_TXT; t++) {
@@ -326,6 +323,50 @@ static void init_positions(void) {
         pos_col[N_VIS + t] = 0;
     }
 }
+
+/* ---- CUDA state ---- */
+#ifdef USE_CUDA
+static cublasHandle_t cublas_h;
+static float **gpu_params;   /* GPU mirrors of weight matrices */
+static float *gpu_scratch;
+static int gpu_scratch_sz;
+
+static void cuda_init_params(void) {
+    cublasCreate(&cublas_h);
+    cublasSetMathMode(cublas_h, CUBLAS_TF32_TENSOR_OP_MATH);
+    gpu_params = calloc(T.np, sizeof(float*));
+    for (int i = 0; i < T.np; i++) {
+        int sz = T.a[T.par[i]].size * (int)sizeof(float);
+        cudaMalloc(&gpu_params[i], sz);
+        cudaMemcpy(gpu_params[i], T.a[T.par[i]].data, sz, cudaMemcpyHostToDevice);
+    }
+    gpu_scratch_sz = 0; gpu_scratch = NULL;
+    printf("  cuda: %d params uploaded to GPU (cuBLAS TF32)\n", T.np);
+}
+
+static float *gpu_ensure_scratch(int n) {
+    if (n > gpu_scratch_sz) {
+        if (gpu_scratch) cudaFree(gpu_scratch);
+        cudaMalloc(&gpu_scratch, n * sizeof(float));
+        gpu_scratch_sz = n;
+    }
+    return gpu_scratch;
+}
+
+static void cuda_sync_params(void) {
+    for (int i = 0; i < T.np; i++) {
+        int sz = T.a[T.par[i]].size * (int)sizeof(float);
+        cudaMemcpy(gpu_params[i], T.a[T.par[i]].data, sz, cudaMemcpyHostToDevice);
+    }
+}
+
+static void cuda_cleanup(void) {
+    for (int i = 0; i < T.np; i++) cudaFree(gpu_params[i]);
+    free(gpu_params);
+    if (gpu_scratch) cudaFree(gpu_scratch);
+    cublasDestroy(cublas_h);
+}
+#endif
 
 /* ---- Forward ops (with awareness tracking) ---- */
 static int op_add(int xi, int yi) {
@@ -345,7 +386,23 @@ static int op_scale(int xi, float s) {
 }
 static int op_mv(int Wi, int xi) {
     int r = T.a[Wi].rows, c = T.a[Wi].cols, zi = anew(r);
-#ifdef USE_BLAS
+#ifdef USE_CUDA
+    /* Find param index for GPU weight */
+    int pi = -1;
+    for (int p = 0; p < T.np; p++) if (T.par[p] == Wi) { pi = p; break; }
+    if (pi >= 0) {
+        float *d_scratch = gpu_ensure_scratch(c + r);
+        float *d_x = d_scratch, *d_z = d_scratch + c;
+        cudaMemcpy(d_x, T.a[xi].data, c * sizeof(float), cudaMemcpyHostToDevice);
+        float alpha = 1.0f, beta = 0.0f;
+        /* row-major W(r×c) × x(c) = z(r) → cublas: W^T in col-major */
+        cublasSgemv(cublas_h, CUBLAS_OP_T, c, r, &alpha, gpu_params[pi], c, d_x, 1, &beta, d_z, 1);
+        cudaMemcpy(T.a[zi].data, d_z, r * sizeof(float), cudaMemcpyDeviceToHost);
+    } else {
+        for (int i = 0; i < r; i++) { float s = 0; const float *Wr = &T.a[Wi].data[i*c];
+            for (int j = 0; j < c; j++) s += Wr[j] * T.a[xi].data[j]; T.a[zi].data[i] = s; }
+    }
+#elif defined(USE_BLAS)
     cblas_sgemv(CblasRowMajor, CblasNoTrans, r, c,
                 1.0f, T.a[Wi].data, c, T.a[xi].data, 1,
                 0.0f, T.a[zi].data, 1);
@@ -619,12 +676,6 @@ static void chuck_step(float lr, float loss) {
     }
 
     /* ═══ Level 9: Multi-scale awareness (macro patience) ═══ */
-    /*
-     *   Slow EMA (α=0.001) tracks epoch-scale loss trend.
-     *   Every CHUCK_MACRO_INT steps, check if training is improving.
-     *   If patience exceeded → scale LR down (like ReduceLROnPlateau but continuous).
-     *   Chuck sees both the forest and the trees.
-     */
     Chuck.global_step++;
     if (Chuck.macro_ema == 0.0f) Chuck.macro_ema = loss;
     else Chuck.macro_ema = 0.999f * Chuck.macro_ema + 0.001f * loss;
@@ -654,12 +705,6 @@ static void chuck_step(float lr, float loss) {
     if (Norm_eye.scale_ema < 0.2f) Chuck.sigma *= 0.9f;
 
     /* ═══ Level 7: Attention entropy awareness ═══ */
-    /*
-     *   H_max = log(seq_len) for uniform attention.
-     *   H → 0: collapsed (one token dominates) → model overfitting to position
-     *   H → H_max: diffuse (all tokens equal) → model not learning attention
-     *   Chuck dampens σ if any head collapses or goes fully diffuse.
-     */
     if (Attn_eye.init) {
         float h_max = logf((float)(N_VIS + MAX_TXT));  /* max possible entropy */
         for (int hd = 0; hd < N_HEAD; hd++) {
@@ -724,14 +769,6 @@ static void chuck_step(float lr, float loss) {
     }
 
     /* ═══ Level 6: Ψ — Subjectivity (memory vs observation) ═══ */
-    /*
-     *   λ_Ψ   = λ + Ψ_w × (λ_prior - λ)
-     *   Ψ_w   = min(0.3, N / (N + 100))
-     *   λ_prior = nearest_neighbor(loss, grad_norm) from chuck.mem
-     *
-     *   When Ψ → 0: memory matches reality. Chuck is home.
-     *   When |Ψ| large: unfamiliar territory. Chuck explores.
-     */
     float gnorm_sq = 0;
     for (int pi = 0; pi < T.np; pi++) { Arr *p = &T.a[T.par[pi]];
         for (int i = 0; i < p->size; i++) gnorm_sq += p->grad[i] * p->grad[i]; }
@@ -751,7 +788,7 @@ static void chuck_step(float lr, float loss) {
         }
     }
 
-    /* Record memory on regime change — Chuck speaks rarely, but always on point */
+    /* Record memory on regime change */
     Chuck.rec_cd++;
     if (Chuck.full && Chuck.rec_cd >= CHUCK_REC_CD) {
         float delta_loss = loss - Chuck.rec_loss;
@@ -775,12 +812,6 @@ static void chuck_step(float lr, float loss) {
     float bc2 = 1.0f - powf(CHUCK_B2, (float)T.cstep);
 
     /* Adaptive gradient clipping — Chuck controls the leash */
-    /*
-     *   Early training (gnorm_ema unset): use base GRAD_CLIP
-     *   Converging (gnorm dropping): tighten clip to protect learned weights
-     *   Exploring (gnorm rising): loosen clip to allow learning
-     *   Anomaly (gnorm > 3× EMA): extra tight — don't let one bad batch wreck everything
-     */
     if (Chuck.gnorm_ema == 0.0f) Chuck.gnorm_ema = gnorm;
     else Chuck.gnorm_ema = 0.97f * Chuck.gnorm_ema + 0.03f * gnorm;
     float adaptive_clip = GRAD_CLIP;
@@ -808,47 +839,68 @@ static void chuck_step(float lr, float loss) {
     }
 }
 
-/* ---- Synthetic digit data ---- */
-static const float digit_pat[10][IMG_SIZE*IMG_SIZE] = {
-    {0,0,.5f,.8f,.8f,.5f,0,0, 0,.5f,.8f,0,0,.8f,.5f,0, .5f,.8f,0,0,0,0,.8f,.5f, .8f,0,0,0,0,0,0,.8f, .8f,0,0,0,0,0,0,.8f, .5f,.8f,0,0,0,0,.8f,.5f, 0,.5f,.8f,0,0,.8f,.5f,0, 0,0,.5f,.8f,.8f,.5f,0,0},
-    {0,0,0,.8f,0,0,0,0, 0,0,.5f,.8f,0,0,0,0, 0,0,0,.8f,0,0,0,0, 0,0,0,.8f,0,0,0,0, 0,0,0,.8f,0,0,0,0, 0,0,0,.8f,0,0,0,0, 0,0,0,.8f,0,0,0,0, 0,0,.5f,.8f,.8f,.5f,0,0},
-    {0,.5f,.8f,.8f,.8f,.5f,0,0, 0,0,0,0,0,.8f,0,0, 0,0,0,0,0,.8f,0,0, 0,0,0,.5f,.8f,.5f,0,0, 0,0,.5f,.8f,0,0,0,0, 0,.5f,.8f,0,0,0,0,0, .5f,.8f,0,0,0,0,0,0, .5f,.8f,.8f,.8f,.8f,.8f,.5f,0},
-    {.5f,.8f,.8f,.8f,.5f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,.5f,.8f,.8f,.5f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, .5f,.8f,.8f,.8f,.5f,0,0,0},
-    {.8f,0,0,0,.8f,0,0,0, .8f,0,0,0,.8f,0,0,0, .8f,0,0,0,.8f,0,0,0, .8f,.8f,.8f,.8f,.8f,.8f,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0},
-    {.5f,.8f,.8f,.8f,.8f,.5f,0,0, .8f,0,0,0,0,0,0,0, .8f,0,0,0,0,0,0,0, .5f,.8f,.8f,.8f,.5f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, .5f,.8f,.8f,.8f,.5f,0,0,0},
-    {0,0,.5f,.8f,.8f,.5f,0,0, 0,.5f,.8f,0,0,0,0,0, .5f,.8f,0,0,0,0,0,0, .8f,.5f,.8f,.8f,.5f,0,0,0, .8f,0,0,0,.8f,0,0,0, .8f,0,0,0,.8f,0,0,0, .5f,.8f,0,0,.8f,0,0,0, 0,.5f,.8f,.8f,.5f,0,0,0},
-    {.8f,.8f,.8f,.8f,.8f,.8f,0,0, 0,0,0,0,.5f,.8f,0,0, 0,0,0,0,.8f,.5f,0,0, 0,0,0,.5f,.8f,0,0,0, 0,0,0,.8f,.5f,0,0,0, 0,0,.5f,.8f,0,0,0,0, 0,0,.8f,.5f,0,0,0,0, 0,0,.8f,0,0,0,0,0},
-    {0,.5f,.8f,.8f,.5f,0,0,0, .8f,0,0,0,.8f,0,0,0, .8f,0,0,0,.8f,0,0,0, 0,.5f,.8f,.8f,.5f,0,0,0, .8f,0,0,0,.8f,0,0,0, .8f,0,0,0,.8f,0,0,0, .8f,0,0,0,.8f,0,0,0, 0,.5f,.8f,.8f,.5f,0,0,0},
-    {0,.5f,.8f,.8f,.5f,0,0,0, .8f,0,0,0,.8f,0,0,0, .8f,0,0,0,.8f,0,0,0, 0,.5f,.8f,.8f,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,0,.8f,0,0,0, 0,0,0,.5f,.8f,0,0,0, 0,.5f,.8f,.8f,.5f,0,0,0},
+/* ===========================================================================
+ * CIFAR-100 — 100 fine-grained classes, 32×32 RGB images
+ *
+ *   Binary format: [coarse_label(1B)][fine_label(1B)][pixels(3072B)]
+ *   Pixels: 1024 R + 1024 G + 1024 B (channel-first, row-major)
+ *   Train: 50000 images, Test: 10000 images
+ *
+ *   Download: https://www.cs.toronto.edu/~kriz/cifar-100-binary.tar.gz
+ * =========================================================================== */
+
+static const char *cifar100_names[N_CLASSES] = {
+    "apple","aquarium_fish","baby","bear","beaver",
+    "bed","bee","beetle","bicycle","bottle",
+    "bowl","boy","bridge","bus","butterfly",
+    "camel","can","castle","caterpillar","cattle",
+    "chair","chimpanzee","clock","cloud","cockroach",
+    "couch","crab","crocodile","cup","dinosaur",
+    "dolphin","elephant","flatfish","forest","fox",
+    "girl","hamster","house","kangaroo","keyboard",
+    "lamp","lawn_mower","leopard","lion","lizard",
+    "lobster","man","maple_tree","motorcycle","mountain",
+    "mouse","mushroom","oak_tree","orange","orchid",
+    "otter","palm_tree","pear","pickup_truck","pine_tree",
+    "plain","plate","poppy","porcupine","possum",
+    "rabbit","raccoon","ray","road","rocket",
+    "rose","sea","seal","shark","shrew",
+    "skunk","skyscraper","snail","snake","spider",
+    "squirrel","streetcar","sunflower","sweet_pepper","table",
+    "tank","telephone","television","tiger","tractor",
+    "train","trout","tulip","turtle","wardrobe",
+    "whale","willow_tree","wolf","woman","worm"
 };
-/* Addition task: two digit images → sum as word */
-typedef struct { float **imgs_a; float **imgs_b; int *da; int *db; int *sums; int n; } Data;
-static Data gen_data(int n) {
-    Data d; d.n = n;
-    d.imgs_a = malloc(n * sizeof(float*)); d.imgs_b = malloc(n * sizeof(float*));
-    d.da = malloc(n * sizeof(int)); d.db = malloc(n * sizeof(int)); d.sums = malloc(n * sizeof(int));
-    for (int i = 0; i < n; i++) {
-        int a = (int)(rnext() % 10), b = (int)(rnext() % 10);
-        d.da[i] = a; d.db[i] = b; d.sums[i] = a + b;
-        d.imgs_a[i] = malloc(IMG_SIZE*IMG_SIZE*sizeof(float));
-        d.imgs_b[i] = malloc(IMG_SIZE*IMG_SIZE*sizeof(float));
-        for (int p = 0; p < IMG_SIZE*IMG_SIZE; p++) {
-            float va = digit_pat[a][p] + rnf(0, 0.07f);
-            float vb = digit_pat[b][p] + rnf(0, 0.07f);
-            d.imgs_a[i][p] = va < 0 ? 0 : va > 1 ? 1 : va;
-            d.imgs_b[i][p] = vb < 0 ? 0 : vb > 1 ? 1 : vb;
-        }
-    }
-    return d;
-}
-static const char *names[] = {
-    "zero","one","two","three","four","five","six","seven","eight","nine",
-    "ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen","seventeen","eighteen"
-};
-static const char chars[] = "efghilnorstuvwxz";
-#define N_CHARS 16
+
+/* Char-level tokenization: a-z + underscore */
+static const char chars[] = "abcdefghijklmnopqrstuvwxyz_";
 static int c2id(char c) { for (int i = 0; i < N_CHARS; i++) if (chars[i] == c) return i; return -1; }
 static char id2c(int i) { return (i == BOS) ? '^' : (i == EOS) ? '$' : (i >= 0 && i < N_CHARS) ? chars[i] : '?'; }
+
+typedef struct { float *imgs; int *labels; int n; } Data;
+
+static Data load_cifar100(const char *path) {
+    Data d = {0};
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); return d; }
+    /* Count records: file_size / 3074 */
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    int n = (int)(sz / 3074);
+    if (n == 0) { fclose(f); return d; }
+    d.n = n;
+    d.imgs = malloc(n * IMG_SIZE * IMG_SIZE * IMG_CH * sizeof(float));
+    d.labels = malloc(n * sizeof(int));
+    uint8_t rec[3074];
+    for (int i = 0; i < n; i++) {
+        if (fread(rec, 1, 3074, f) != 3074) { d.n = i; break; }
+        d.labels[i] = rec[1]; /* fine label */
+        float *img = &d.imgs[i * IMG_SIZE * IMG_SIZE * IMG_CH];
+        /* Convert planar uint8 → channel-first float [0,1] */
+        for (int j = 0; j < 3072; j++) img[j] = rec[2 + j] / 255.0f;
+    }
+    fclose(f);
+    return d;
+}
 
 /* ---- Model (GQA: wk/wv use KV_DIM) ---- */
 typedef struct {
@@ -863,10 +915,10 @@ static int init_w(int r, int c, float s) {
     preg(i); return i;
 }
 static void init_model(void) {
-    M.patch_proj = init_w(N_EMBD, PATCH_PX, 0.1f);        /* param 0 */
-    M.wte = init_w(VOCAB, N_EMBD, 0.08f);                  /* param 1 */
+    M.patch_proj = init_w(N_EMBD, PATCH_PX, sqrtf(2.0f / PATCH_PX));  /* param 0: (256, 192) */
+    M.wte = init_w(VOCAB, N_EMBD, 0.02f);                               /* param 1: (29, 256) */
     for (int i = 0; i < N_LAYER; i++) {
-        float s = 0.08f / sqrtf(2.0f * N_LAYER);
+        float s = 0.02f / sqrtf(2.0f * N_LAYER);
         M.L[i].wq = init_w(N_EMBD, N_EMBD, s);             /* param 2+7i+0 */
         M.L[i].wk = init_w(KV_DIM, N_EMBD, s);             /* param 2+7i+1: GQA! */
         M.L[i].wv = init_w(KV_DIM, N_EMBD, s);             /* param 2+7i+2: GQA! */
@@ -925,16 +977,85 @@ static int gpt_step(int x, int pos, int layer_track) {
     return op_mv(M.wte, op_rms(h));  /* weight-tied lm_head */
 }
 
-/* ---- Vision encoder: ViT-style patch tokenization ---- */
-static void encode_vis(float *pix, int *tok) {
+/* ---- Vision encoder: ViT-style RGB patch tokenization ---- */
+static void encode_vis(float *img, int *tok) {
+    /* img: channel-first [3][32][32], patches: 8×8×3 = 192 floats */
     for (int py = 0; py < PATCHES_SIDE; py++)
         for (int px = 0; px < PATCHES_SIDE; px++) {
             int pi = anew(PATCH_PX); float *pd = T.a[pi].data;
-            for (int y = 0; y < PATCH_SIZE; y++)
-                for (int x = 0; x < PATCH_SIZE; x++)
-                    pd[y*PATCH_SIZE + x] = pix[(py*PATCH_SIZE+y)*IMG_SIZE + px*PATCH_SIZE+x];
+            for (int c = 0; c < IMG_CH; c++)
+                for (int y = 0; y < PATCH_SIZE; y++)
+                    for (int x = 0; x < PATCH_SIZE; x++)
+                        pd[c*PATCH_SIZE*PATCH_SIZE + y*PATCH_SIZE + x] =
+                            img[c*IMG_SIZE*IMG_SIZE + (py*PATCH_SIZE+y)*IMG_SIZE + px*PATCH_SIZE+x];
             tok[py*PATCHES_SIDE + px] = op_mv(M.patch_proj, pi);
         }
+}
+
+/* ===========================================================================
+ * Checkpoint — save/load model weights + optimizer state
+ *
+ *   Format: [magic 4B][step 4B][np 4B]
+ *           [param_sizes np×4B]
+ *           [param_data ...][adam_m ...][adam_v ...]
+ *           [Chuck state][ChuckLayer×N_LAYER][chuck_mem]
+ * =========================================================================== */
+#define CKPT_MAGIC 0x4C454538  /* "LEE8" */
+
+static void ckpt_save(const char *path, int step) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "ckpt: cannot write %s\n", path); return; }
+    uint32_t magic = CKPT_MAGIC;
+    fwrite(&magic, 4, 1, f);
+    fwrite(&step, 4, 1, f);
+    int np = T.np; fwrite(&np, 4, 1, f);
+    /* param sizes */
+    for (int i = 0; i < np; i++) { int sz = T.a[T.par[i]].size; fwrite(&sz, 4, 1, f); }
+    /* param data — the only thing that matters */
+    for (int i = 0; i < np; i++) fwrite(T.a[T.par[i]].data, sizeof(float), T.a[T.par[i]].size, f);
+    /* Chuck global state — his soul */
+    fwrite(&Chuck, sizeof(Chuck), 1, f);
+    /* Chuck per-layer awareness */
+    fwrite(CL, sizeof(ChuckLayer), N_LAYER, f);
+    /* Chuck memory — persistent experience */
+    fwrite(&chuck_mem_n, 4, 1, f);
+    fwrite(&chuck_mem_total, 4, 1, f);
+    fwrite(chuck_mem, sizeof(ChuckMem), chuck_mem_n, f);
+    fclose(f);
+    long sz = 0; FILE *chk = fopen(path, "rb");
+    if (chk) { fseek(chk, 0, SEEK_END); sz = ftell(chk); fclose(chk); }
+    printf("  ckpt: saved step %d → %s (%.1fMB)\n", step, path, sz / (1024.0f * 1024.0f));
+}
+
+static int ckpt_load(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "ckpt: cannot read %s\n", path); return -1; }
+    uint32_t magic; fread(&magic, 4, 1, f);
+    if (magic != CKPT_MAGIC) { fprintf(stderr, "ckpt: bad magic in %s\n", path); fclose(f); return -1; }
+    int step, np;
+    fread(&step, 4, 1, f);
+    fread(&np, 4, 1, f);
+    if (np != T.np) { fprintf(stderr, "ckpt: param count mismatch (%d vs %d)\n", np, T.np); fclose(f); return -1; }
+    /* verify sizes */
+    for (int i = 0; i < np; i++) {
+        int sz; fread(&sz, 4, 1, f);
+        if (sz != T.a[T.par[i]].size) { fprintf(stderr, "ckpt: param %d size mismatch\n", i); fclose(f); return -1; }
+    }
+    /* param data */
+    for (int i = 0; i < np; i++) fread(T.a[T.par[i]].data, sizeof(float), T.a[T.par[i]].size, f);
+    /* Chuck global state — his soul persists */
+    fread(&Chuck, sizeof(Chuck), 1, f);
+    /* Chuck per-layer awareness */
+    fread(CL, sizeof(ChuckLayer), N_LAYER, f);
+    /* Chuck memory — he remembers */
+    fread(&chuck_mem_n, 4, 1, f);
+    fread(&chuck_mem_total, 4, 1, f);
+    if (chuck_mem_n > 0) fread(chuck_mem, sizeof(ChuckMem), chuck_mem_n, f);
+    fclose(f);
+    /* Adam m/v stay zeroed — Chuck's Ψ memory handles the warmup.
+     * He's been here before. He knows the landscape. */
+    printf("  ckpt: loaded step %d from %s (%d chuck memories, Ψ ready)\n", step, path, chuck_mem_n);
+    return step;
 }
 
 static float cos_lr(int step, int total) {
@@ -944,24 +1065,35 @@ static float cos_lr(int step, int total) {
 }
 
 /* ---- Training ---- */
+static const char *g_ckpt_path = "lee.bin";
+static int g_start_step = 0;
+
 static void train(Data *data) {
     printf("\n=== TRAINING (%d steps, Chuck v7 — multi-scale + reservoir memory) ===\n", STEPS);
     int tp = 0; for (int i = 0; i < T.np; i++) tp += T.a[T.par[i]].size;
-    printf("  %d params (%.1fK) | %d layers | GQA %dQ/%dKV | embd=%d | %d imgs x %d patches | 2D RoPE | weight-tied\n",
-           tp, tp/1000.0f, N_LAYER, N_HEAD, N_KV_HEAD, N_EMBD, N_IMGS, N_PATCHES);
-    printf("  task: [digit_a] + [digit_b] → sum as word (0+0..9+9, 19 classes)\n\n");
+    printf("  %d params (%.1fM) | %d layers | GQA %dQ/%dKV | embd=%d | %d patches (RGB %dx%d) | 2D RoPE | weight-tied\n",
+           tp, tp/1000000.0f, N_LAYER, N_HEAD, N_KV_HEAD, N_EMBD, N_PATCHES, PATCH_SIZE, PATCH_SIZE);
+    printf("  task: CIFAR-100 image classification → class name (100 classes, char-level)\n");
+    printf("  data: %d images\n", data->n);
+    if (g_start_step > 0) printf("  resuming from step %d\n", g_start_step);
+    printf("\n");
     float rl = 0; int rn = 0;
-    for (int step = 0; step < STEPS; step++) {
-        int idx = (int)(rnext() % (uint64_t)data->n); int label = data->sums[idx];
-        const char *name = names[label]; int nlen = strlen(name);
-        int toks[MAX_TXT+2]; int nt = 0;
-        toks[nt++] = BOS; for (int i = 0; i < nlen; i++) toks[nt++] = c2id(name[i]); toks[nt++] = EOS;
+    for (int step = g_start_step; step < STEPS; step++) {
+        int idx = (int)(rnext() % (uint64_t)data->n);
+        int label = data->labels[idx];
+        const char *name = cifar100_names[label]; int nlen = strlen(name);
+        int toks[MAX_TXT]; int nt = 0;
+        toks[nt++] = BOS;
+        for (int i = 0; i < nlen && nt < MAX_TXT - 1; i++) toks[nt++] = c2id(name[i]);
+        toks[nt++] = EOS;
         tape_reset(); kv_clear();
         silu_eye_reset(); rope_eye_reset(); attn_eye_reset();
+        /* Encode image patches */
         int vt[N_VIS];
-        encode_vis(data->imgs_a[idx], vt);             /* first digit */
-        encode_vis(data->imgs_b[idx], vt + N_PATCHES); /* second digit */
+        float *img = &data->imgs[idx * IMG_SIZE * IMG_SIZE * IMG_CH];
+        encode_vis(img, vt);
         for (int p = 0; p < N_VIS; p++) gpt_step(vt[p], p, 0);
+        /* Autoregressive text loss */
         int la[MAX_TXT]; int nl = 0;
         for (int t = 0; t < nt - 1; t++) {
             int pos = N_VIS + t, te = op_embed(M.wte, toks[t]);
@@ -971,17 +1103,22 @@ static void train(Data *data) {
         int loss = op_reduce(la, nl); backward(loss);
         float lv = T.a[loss].data[0];
         chuck_step(cos_lr(step, STEPS), lv);
+#ifdef USE_CUDA
+        if ((step + 1) % 10 == 0) cuda_sync_params(); /* sync GPU weights periodically */
+#endif
         rl += lv; rn++;
-        if ((step+1) % 250 == 0) {
+        if ((step+1) % 500 == 0) {
             float elr = cos_lr(step, STEPS) * Chuck.dampen * Chuck.lr_scale;
             printf("  step %5d/%d | loss %.4f (avg %.4f) | lr %.6f\n",
                    step+1, STEPS, lv, rl/rn, elr);
             printf("    chuck: \xce\xbb=%.2f \xce\xa8=%+.2f (\xce\xa8w=%.2f, %d mem) \xcf\x83=%.2f macro=%.2f",
                    Chuck.dampen, Chuck.psi, Chuck.psi_w, chuck_mem_n, Chuck.sigma, Chuck.lr_scale);
             if (Chuck.macro_drops > 0) printf(" (%d drops)", Chuck.macro_drops);
+            /* Show first and last 2 layers only (10 layers is too many for one line) */
             for (int l = 0; l < N_LAYER; l++) {
-                if (CL[l].frozen) printf(" | L%d: frozen", l);
-                else printf(" | L%d: %.2f", l, CL[l].dampen);
+                if (l == 2 && N_LAYER > 5) { printf(" | ..."); l = N_LAYER - 2; continue; }
+                if (CL[l].frozen) printf(" | L%d:frz", l);
+                else printf(" | L%d:%.2f", l, CL[l].dampen);
             }
             printf("\n    silu: %.0f%% alive | norm: %.1f | rope: %.0f%%",
                    SiLU_eye.health * 100, Norm_eye.scale_ema, RoPE_eye.utilization * 100);
@@ -989,59 +1126,64 @@ static void train(Data *data) {
                 printf(" | attn H:");
                 for (int hd = 0; hd < N_HEAD; hd++) printf(" %.2f", Attn_eye.entropy_ema[hd]);
             }
-            if (act_mag[0] > 0) {
-                printf(" | flow:");
-                for (int l = 0; l < N_LAYER; l++) printf(" %.2f%s", act_mag[l], l<N_LAYER-1?"→":"");
-            }
             printf("\n");
             rl = 0; rn = 0;
         }
+        /* Auto-save every 5000 steps */
+        if ((step+1) % 5000 == 0) ckpt_save(g_ckpt_path, step+1);
     }
+    /* Final save */
+    ckpt_save(g_ckpt_path, STEPS);
+#ifdef USE_CUDA
+    cuda_sync_params(); /* final sync */
+#endif
 }
 
 /* ---- Sampling ---- */
 static int sample_topk(float *logits, int vocab, float temp, int topk) {
-    float sc[VOCAB]; for (int i = 0; i < vocab; i++) sc[i] = logits[i] / temp;
+    float *sc = malloc(vocab * sizeof(float));
+    for (int i = 0; i < vocab; i++) sc[i] = logits[i] / temp;
     float mx = sc[0]; for (int i = 1; i < vocab; i++) if (sc[i] > mx) mx = sc[i];
-    float p[VOCAB]; float s = 0;
+    float *p = malloc(vocab * sizeof(float)); float s = 0;
     for (int i = 0; i < vocab; i++) { p[i] = expf(sc[i] - mx); s += p[i]; }
     for (int i = 0; i < vocab; i++) p[i] /= s;
-    float tv[TOPK]; int ti[TOPK];
+    int *ti = malloc(topk * sizeof(int)); float *tv = malloc(topk * sizeof(float));
     for (int k = 0; k < topk && k < vocab; k++) { int best = 0; float bv = -1e9f;
         for (int i = 0; i < vocab; i++) { int taken = 0;
             for (int j = 0; j < k; j++) if (ti[j] == i) { taken = 1; break; }
             if (!taken && p[i] > bv) { bv = p[i]; best = i; } }
         ti[k] = best; tv[k] = bv; }
     float ts = 0; for (int k = 0; k < topk; k++) ts += tv[k];
-    float r = ruf() * ts, cum = 0;
-    for (int k = 0; k < topk; k++) { cum += tv[k]; if (cum >= r) return ti[k]; }
-    return ti[0];
+    float r = ruf() * ts, cum = 0; int result = ti[0];
+    for (int k = 0; k < topk; k++) { cum += tv[k]; if (cum >= r) { result = ti[k]; break; } }
+    free(sc); free(p); free(ti); free(tv);
+    return result;
 }
 
 /* ---- Inference ---- */
 static void inference(Data *data) {
-    printf("\n=== INFERENCE — digit addition (temp=%.1f, top-k=%d) ===\n\n", TEMP, TOPK);
+    printf("\n=== INFERENCE — CIFAR-100 classification (temp=%.1f, top-k=%d) ===\n\n", TEMP, TOPK);
     T.on = 0; int correct = 0, total = 0;
-    /* Test 50 random addition problems */
-    for (int s = 0; s < 50; s++) {
-        int idx = s % data->n;
-        int label = data->sums[idx];
+    int n_test = data->n < 200 ? data->n : 200; /* test up to 200 samples */
+    for (int s = 0; s < n_test; s++) {
+        int idx = s;
+        int label = data->labels[idx];
         tape_reset(); kv_clear();
         int vt[N_VIS];
-        encode_vis(data->imgs_a[idx], vt);
-        encode_vis(data->imgs_b[idx], vt + N_PATCHES);
+        float *img = &data->imgs[idx * IMG_SIZE * IMG_SIZE * IMG_CH];
+        encode_vis(img, vt);
         for (int p = 0; p < N_VIS; p++) gpt_step(vt[p], p, 0);
         int tok = BOS; char gen[MAX_TXT+1]; int gl = 0;
-        for (int t = 0; t < MAX_TXT; t++) {
+        for (int t = 0; t < MAX_TXT - 1; t++) {
             int pos = N_VIS + t, te = op_embed(M.wte, tok);
             int lg = gpt_step(te, pos, 0);
             tok = sample_topk(T.a[lg].data, VOCAB, TEMP, TOPK);
             if (tok == EOS || tok == BOS) break;
             if (gl < MAX_TXT) gen[gl++] = id2c(tok);
         }
-        gen[gl] = '\0'; int ok = strcmp(gen, names[label]) == 0; correct += ok; total++;
-        printf("  %d+%d=%d  true: %-10s | gen: %-10s %s\n",
-               data->da[idx], data->db[idx], label, names[label], gen, ok ? "OK" : "MISS");
+        gen[gl] = '\0'; int ok = strcmp(gen, cifar100_names[label]) == 0; correct += ok; total++;
+        if (s < 30 || ok) /* print first 30 and all correct */
+            printf("  [%3d] true: %-16s | gen: %-16s %s\n", idx, cifar100_names[label], gen, ok ? "OK" : "MISS");
     }
     printf("\n  accuracy: %d/%d (%.1f%%)\n", correct, total, 100.0f*correct/total);
 
@@ -1053,16 +1195,69 @@ static void inference(Data *data) {
     T.on = 1;
 }
 
-int main(void) {
-    printf("lee.c v7 — Vision-Language Model in pure C\n");
-    printf("GQA %dQ/%dKV | %d layers | 2D RoPE | SwiGLU | Chuck v7 (multi-scale + reservoir memory)\n",
-           N_HEAD, N_KV_HEAD, N_LAYER);
+int main(int argc, char **argv) {
+    setbuf(stdout, NULL); /* unbuffered for background/pipe */
+    const char *data_dir = "cifar-100-binary";
+    const char *resume_path = NULL;
+    const char *save_path = "lee.bin";
+
+    /* Parse CLI */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--data") == 0 && i+1 < argc) data_dir = argv[++i];
+        else if (strcmp(argv[i], "--resume") == 0 && i+1 < argc) resume_path = argv[++i];
+        else if (strcmp(argv[i], "--save") == 0 && i+1 < argc) save_path = argv[++i];
+    }
+    g_ckpt_path = save_path;
+
+    printf("lee.c v8 — Vision-Language Model in pure C\n");
+    printf("GQA %dQ/%dKV | %d layers | embd=%d | head=%d | mlp=%d | 2D RoPE | SwiGLU\n",
+           N_HEAD, N_KV_HEAD, N_LAYER, N_EMBD, HEAD_DIM, MLP_DIM);
+    printf("Chuck v7 (multi-scale + reservoir memory) | CIFAR-100 classification\n");
     printf("Named after Bruce Lee and Minhyeok Lee. Chuck sees inside the transformer.\n\n");
+
     clock_t t0 = clock(); rseed(42);
     init_positions(); tape_init(); chuck_init(); init_model();
-    printf("generating 10000 addition problems (digit pairs + sums)...\n");
-    Data d = gen_data(10000); printf("done.\n");
-    train(&d); inference(&d);
+
+    /* Count params */
+    int tp = 0; for (int i = 0; i < T.np; i++) tp += T.a[T.par[i]].size;
+    printf("  params: %d (%.2fM)\n", tp, tp / 1000000.0f);
+    printf("  arena: %dMB allocated, %.1fMB used by params\n",
+           ARENA_SZ / (1024*1024), (float)T.aparam / (1024*1024));
+
+    /* Resume from checkpoint */
+    if (resume_path) {
+        int s = ckpt_load(resume_path);
+        if (s >= 0) g_start_step = s;
+        else { fprintf(stderr, "failed to load checkpoint, starting fresh\n"); }
+    }
+
+#ifdef USE_CUDA
+    cuda_init_params();
+#endif
+
+    /* Load CIFAR-100 data */
+    char train_path[512], test_path[512];
+    snprintf(train_path, sizeof(train_path), "%s/train.bin", data_dir);
+    snprintf(test_path, sizeof(test_path), "%s/test.bin", data_dir);
+
+    printf("  loading training data from %s...\n", train_path);
+    Data train_data = load_cifar100(train_path);
+    if (train_data.n == 0) {
+        fprintf(stderr, "\nerror: cannot load CIFAR-100 data from %s\n", train_path);
+        fprintf(stderr, "download from: https://www.cs.toronto.edu/~kriz/cifar-100-binary.tar.gz\n");
+        fprintf(stderr, "extract and pass: ./lee --data /path/to/cifar-100-binary\n");
+        return 1;
+    }
+    printf("  loaded %d training images\n", train_data.n);
+
+    printf("  loading test data from %s...\n", test_path);
+    Data test_data = load_cifar100(test_path);
+    printf("  loaded %d test images\n\n", test_data.n);
+
+    train(&train_data);
+    if (test_data.n > 0) inference(&test_data);
+    else inference(&train_data); /* fallback: test on train if no test set */
+
     printf("\ntotal: %.1fs\n", (double)(clock()-t0)/CLOCKS_PER_SEC);
     printf("chuck.mem: %d memories (%.1f KB) | \xce\xa8_w=%.3f\n",
            chuck_mem_n, (float)(chuck_mem_n * (int)sizeof(ChuckMem)) / 1024.0f, Chuck.psi_w);
@@ -1070,8 +1265,14 @@ int main(void) {
         printf("  next run: Chuck starts with experience. \xce\xa8 \xe2\x89\xa0 0. He remembers.\n");
     else
         printf("  first run: Chuck has no memories yet. Pure reactive. Newborn.\n");
-    for (int i = 0; i < d.n; i++) { free(d.imgs_a[i]); free(d.imgs_b[i]); }
-    free(d.imgs_a); free(d.imgs_b); free(d.da); free(d.db); free(d.sums);
-    for (int i = 0; i < T.np; i++) { free(T.cm[i]); free(T.cv[i]); } free(T.arena);
+
+    /* Cleanup */
+    free(train_data.imgs); free(train_data.labels);
+    if (test_data.n > 0) { free(test_data.imgs); free(test_data.labels); }
+    for (int i = 0; i < T.np; i++) { free(T.cm[i]); free(T.cv[i]); }
+#ifdef USE_CUDA
+    cuda_cleanup();
+#endif
+    free(T.arena);
     printf("\ndone.\n"); return 0;
 }
