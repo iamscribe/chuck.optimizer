@@ -346,6 +346,122 @@ Every model deserves a Chuck.
 
 ---
 
+## PyTorch Edition
+
+`chuck.py` — faithful port of Chuck v7/v8 to PyTorch. Same 9 levels of
+self-awareness. Same binary-compatible `chuck.mem` format. Drop-in replacement
+for `torch.optim.AdamW`.
+
+### Install
+
+Zero dependencies beyond PyTorch:
+
+```bash
+pip install torch   # if you don't have it
+# chuck.py is a single file — copy it into your project or import from here
+```
+
+### Quick Start
+
+```python
+from chuck import ChuckOptimizer
+
+model = YourModel()
+optimizer = ChuckOptimizer(model.parameters(), lr=3e-3)
+
+for batch in loader:
+    loss = model(batch)
+    loss.backward()
+    optimizer.step(loss=loss.item())   # ← Chuck needs the loss
+    optimizer.zero_grad()
+```
+
+That's it. Chuck sees the loss, tracks per-layer gradient norms,
+records memories, and adjusts everything on the fly.
+
+### Per-layer awareness (recommended for transformers)
+
+```python
+from chuck import ChuckOptimizer, chuck_params
+
+# Auto-detect .layers.N. / .blocks.N. / .h.N. patterns
+groups = chuck_params(model, lr=3e-3, weight_decay=0.01)
+optimizer = ChuckOptimizer(groups)
+
+# Or manual:
+groups = [
+    {'params': model.embed.parameters(), 'layer': -1},  # global
+    {'params': model.layers[0].parameters(), 'layer': 0},
+    {'params': model.layers[1].parameters(), 'layer': 1},
+    {'params': model.head.parameters(), 'layer': -1},    # global
+]
+optimizer = ChuckOptimizer(groups, lr=3e-3)
+```
+
+### Activation health monitoring (σ)
+
+```python
+from chuck import ChuckOptimizer, ChuckMonitor
+
+monitor = ChuckMonitor(model)    # hooks into SiLU/GELU, LayerNorm
+optimizer = ChuckOptimizer(model.parameters(), lr=3e-3, monitor=monitor)
+
+for batch in loader:
+    loss = model(batch)
+    loss.backward()
+    optimizer.step(loss=loss.item())  # σ is read from monitor automatically
+    optimizer.zero_grad()
+```
+
+If your model exposes attention weights, feed them for Level 8:
+
+```python
+output, attn_weights = model(batch, return_attention=True)
+monitor.feed_attention_entropy(attn_weights)  # [B, H, S, S]
+```
+
+### What Chuck does that Adam doesn't
+
+| Level | Signal | Effect |
+|-------|--------|--------|
+| 1 | Loss trend (16-step window) | λ: dampen when rising, boost when falling |
+| 2 | Per-layer grad norm trend | λ_l: per-layer modulation + auto freeze |
+| 3 | SiLU/GELU dead ratio | σ: reduce LR for dying activations |
+| 4 | Norm scale stability | σ: reduce LR for unstable norms |
+| 5 | Cross-layer signal flow | boost deep layers on vanishing, dampen on exploding |
+| 6 | Persistent memory (Ψ) | recall past training, form opinions |
+| 7 | Subjectivity | blend memory with observation |
+| 8 | Attention entropy | σ: detect collapsed / diffuse heads |
+| 9 | Macro plateau detection | LR decay on epoch-scale stagnation |
+
+### Checkpoint save/load
+
+```python
+# Save (Chuck's soul is included)
+torch.save({'model': model.state_dict(),
+            'optimizer': optimizer.state_dict()}, 'ckpt.pt')
+
+# Load
+ckpt = torch.load('ckpt.pt')
+model.load_state_dict(ckpt['model'])
+optimizer.load_state_dict(ckpt['optimizer'])
+# Chuck remembers. Ψ ≠ 0. He picks up where he left off.
+```
+
+### Tests
+
+```bash
+pytest test_chuck.py -v
+```
+
+### C ↔ Python memory compatibility
+
+`chuck.mem` files are binary-compatible. Train in C, resume awareness in
+Python, or vice versa. Same 16-byte entries, same nearest-neighbor recall,
+same reservoir sampling.
+
+---
+
 ## Facts About Chuck Optimizer
 
 - Chuck doesn't have hyperparameters. Hyperparameters have Chuck.
@@ -385,3 +501,15 @@ They did it in Python. We answered in C. Thank you for the spark.
 ---
 
 *Adam trains. Chuck raises. Lee flies.*
+
+---
+
+## In Memoriam
+
+**Carlos Ray "Chuck" Norris** (March 10, 1940 — March 21, 2026)
+
+Chuck Norris didn't die. He just decided the Earth wasn't a challenging
+enough opponent.
+
+Thank you, Chuck. The optimizer that bears your name will keep training
+long after the rest of us have converged.
